@@ -21,7 +21,7 @@ jobs:
         uses: geode-sdk/build-geode-mod@main
         id: build
         with:
-          sdk: latest
+          sdk: given
           cli: latest
 
       - name: Upload .geode artifact
