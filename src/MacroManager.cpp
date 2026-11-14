@@ -1,0 +1,578 @@
+#include "MacroManager.hpp"
+#include <Geode/Geode.hpp>
+#include <fstream>
+#include <algorithm>
+#include <cmath>
+#include <map>
+#include <set>
+
+using namespace geode::prelude;
+
+namespace macrobot {
+
+MacroManager& MacroManager::get() {
+    static MacroManager instance;
+    return instance;
+}
+
+std::filesystem::path MacroManager::macrosDir() const {
+    auto dir = Mod::get()->getSaveDir() / "macros";
+    if (!std::filesystem::exists(dir)) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+    }
+    return dir;
+}
+
+static std::string sanitizeFilename(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == ' ' || c == '-' || c == '_') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) out = "macro";
+    return out;
+}
+
+static std::string trimSpaces(const std::string& raw) {
+    size_t start = raw.find_first_not_of(' ');
+    if (start == std::string::npos) return "";
+    size_t end = raw.find_last_not_of(' ');
+    return raw.substr(start, end - start + 1);
+}
+
+static std::filesystem::path uniqueMacroPath(const std::filesystem::path& dir, const std::string& base) {
+    auto path = dir / (base + ".mbf");
+    int suffix = 2;
+    while (std::filesystem::exists(path)) {
+        path = dir / (base + " (" + std::to_string(suffix) + ").mbf");
+        suffix++;
+    }
+    return path;
+}
+
+// Removes, for each (button, player) combo, its final event IF that
+// final event is a press — i.e. a button still "held" when recording
+// stopped. GD's hold-jump-to-restart gesture (or a jump simply cut short
+// by death) generates a real handleButton(true, ...) call indistinguishable
+// from any other press at the moment it happens, but it isn't meaningful
+// gameplay input worth keeping in the saved macro.
+static void trimTrailingUnreleasedPresses(std::vector<InputEvent>& events) {
+    std::map<std::pair<uint8_t, bool>, size_t> lastIndex;
+    for (size_t i = 0; i < events.size(); i++) {
+        lastIndex[{events[i].button, events[i].player}] = i;
+    }
+
+    std::vector<size_t> toRemove;
+    for (auto& [key, idx] : lastIndex) {
+        if (events[idx].state) {
+            toRemove.push_back(idx);
+        }
+    }
+    if (toRemove.empty()) return;
+
+    std::sort(toRemove.begin(), toRemove.end());
+    for (auto it = toRemove.rbegin(); it != toRemove.rend(); ++it) {
+        events.erase(events.begin() + static_cast<long>(*it));
+    }
+}
+
+// Drops trailing events that landed on essentially the same tick as the
+// reset itself. On death, GD force-releases any button the player was
+// still holding as part of its own cleanup — that generates a real
+// handleButton(false, ...) call, indistinguishable at the moment it
+// happens from a deliberate release, but it's death cleanup, not
+// something the player actually did. Unlike an unreleased trailing
+// press, this looks like a perfectly normal, properly-paired release —
+// so it isn't caught by trimTrailingUnreleasedPresses above and needs
+// its own pass. A tiny tolerance (a couple of frames) is enough to catch
+// it without discarding a genuine release the player happened to make
+// just before dying.
+static void trimTrailingEventsAtFrame(std::vector<InputEvent>& events, uint32_t resetFrame) {
+    while (!events.empty() && events.back().frame + 2 >= resetFrame) {
+        events.pop_back();
+    }
+}
+
+void MacroManager::startRecording() {
+    m_mode = Mode::Recording;
+    m_frame = 0;
+    m_buffer = MacroData{};
+    m_buffer.levelName = m_levelName;
+    m_timeLog.clear();
+    m_haveStartTime = false;
+    m_logThrottle = 0;
+    log::info("MacroBot: recording started for level '{}'", m_levelName);
+}
+
+void MacroManager::logTime(double levelTime) {
+    if (m_mode != Mode::Recording) return;
+
+    if (!m_haveStartTime) {
+        m_sessionStartTime = levelTime;
+        m_haveStartTime = true;
+        log::info("MacroBot: [log] session start level-time captured: t={:.4f} (frame {})", levelTime, m_frame);
+    }
+
+    // Throttle: a sample every few substeps is already far more
+    // resolution than matching a respawn time back to a frame needs, and
+    // keeps this cheap over a long recording.
+    if (++m_logThrottle < 4) return;
+    m_logThrottle = 0;
+
+    // Keep the log monotonic (skip samples that don't advance past the
+    // last one — level time only moves backward if something's actually
+    // wrong, unlike X position on a backward-scrolling level) and
+    // bounded, so an extremely long recording can't grow this
+    // unboundedly.
+    if (!m_timeLog.empty() && levelTime <= m_timeLog.back().first) return;
+    m_timeLog.emplace_back(levelTime, m_frame);
+    if (m_timeLog.size() > 20000) {
+        m_timeLog.erase(m_timeLog.begin(), m_timeLog.begin() + 10000);
+    }
+}
+
+uint32_t MacroManager::frameForLevelTime(double levelTime) const {
+    uint32_t best = 0;
+    double bestTime = -1e18;
+    for (auto& sample : m_timeLog) {
+        if (sample.first <= levelTime && sample.first > bestTime) {
+            bestTime = sample.first;
+            best = sample.second;
+        }
+    }
+    return best;
+}
+
+void MacroManager::truncateToFrame(uint32_t frame) {
+    auto& events = m_buffer.events;
+    events.erase(
+        std::remove_if(events.begin(), events.end(),
+            [frame](const InputEvent& ev) { return ev.frame > frame; }),
+        events.end()
+    );
+    m_timeLog.erase(
+        std::remove_if(m_timeLog.begin(), m_timeLog.end(),
+            [frame](const std::pair<double, uint32_t>& sample) { return sample.second > frame; }),
+        m_timeLog.end()
+    );
+}
+
+void MacroManager::onLevelReset(double respawnLevelTime, bool practiceMode) {
+    log::info("MacroBot: [reset] mode={} practiceMode={} respawnLevelTime={:.4f} haveStartTime={} sessionStartTime={:.4f} frame={} bufferedEvents={} timeLogSize={}",
+               static_cast<int>(m_mode), practiceMode, respawnLevelTime, m_haveStartTime, m_sessionStartTime, m_frame,
+               m_buffer.events.size(), m_timeLog.size());
+
+    if (m_pendingPlaybackStart) {
+        // The reset beginPlayback() triggered has now settled — this is
+        // the moment playback actually starts, not when startPlaying()
+        // was originally called. Fixes the double-fire bug described in
+        // notifyResetLevelCalled()'s comment.
+        m_pendingPlaybackStart = false;
+        m_awaitingResetSettle = false;
+        m_mode = Mode::Playing;
+        m_frame = 0;
+        m_playCursor = 0;
+        log::info("MacroBot: [reset] reset settled — playback starting now (frame 0, cursor 0)");
+        return;
+    }
+
+    if (m_mode == Mode::Recording) {
+        if (!m_haveStartTime) {
+            // No real gameplay has happened yet — this is almost
+            // certainly the reset that fires when practice mode itself
+            // first kicks in, immediately after pressing Record (before
+            // a single level-time sample has been logged). There's
+            // nothing to end or roll back yet: just absorb it and keep
+            // Recording. The very next logTime() call, once actual
+            // gameplay resumes, establishes the session's real starting
+            // time. Without this check, that initial reset was being
+            // misread as "genuine restart" every time (m_haveStartTime
+            // && ... short-circuits to false when it's false), ending
+            // the session before the player had even started playing.
+            log::info("MacroBot: [reset] no start time logged yet — absorbing, staying Recording");
+            m_frame = 0;
+            return;
+        }
+
+        // A reset at the level start is ambiguous: it can be a genuine
+        // restart, but it can also be a normal practice-mode death before
+        // the first checkpoint. Practice mode is therefore the authority
+        // for whether this reset ends the recording session.
+        if (practiceMode) {
+            // A checkpoint respawn lands meaningfully past the session's
+            // recorded starting time. Roll back to the most recent
+            // recorded frame at that time, discarding only the failed
+            // attempt. A respawn at the start is a normal practice-mode
+            // death (or restart), so roll back to frame 0 and keep
+            // Recording.
+            double delta = std::fabs(respawnLevelTime - m_sessionStartTime);
+            bool isCheckpointRespawn = delta >= 0.15;
+            log::info("MacroBot: [reset] still in practice mode — delta={:.4f}s -> {}",
+                       delta, isCheckpointRespawn ? "CHECKPOINT RESPAWN" : "RESET AT START");
+
+            if (isCheckpointRespawn) {
+                uint32_t resumeFrame = frameForLevelTime(respawnLevelTime);
+                size_t beforeCount = m_buffer.events.size();
+                truncateToFrame(resumeFrame);
+                m_frame = resumeFrame;
+                log::info("MacroBot: checkpoint respawn — resuming recording at frame {} (events {} -> {})",
+                           m_frame, beforeCount, m_buffer.events.size());
+            } else {
+                size_t beforeCount = m_buffer.events.size();
+                truncateToFrame(0);
+                m_frame = 0;
+                log::info("MacroBot: practice-mode reset at start — restarting recording from frame 0 (events {} -> {})",
+                           beforeCount, m_buffer.events.size());
+            }
+            return;
+        }
+
+        // Practice mode has ended. Now, and only now, finish the current
+        // recording and wait for Save. Trim trailing artifacts first: an
+        // unreleased press (GD's hold-jump-to-restart gesture, or a jump
+        // simply cut short by death), then anything landing on essentially
+        // the same tick as this reset (GD force-releasing a still-held
+        // button as part of its own death cleanup).
+        size_t beforeTrim = m_buffer.events.size();
+        trimTrailingUnreleasedPresses(m_buffer.events);
+        trimTrailingEventsAtFrame(m_buffer.events, m_frame);
+        log::info("MacroBot: [reset] practice mode ended — trimmed {} -> {} events, moving to Standby",
+                   beforeTrim, m_buffer.events.size());
+        m_buffer.totalFrames = m_frame;
+        m_mode = Mode::Standby;
+        m_timeLog.clear();
+        m_haveStartTime = false;
+        log::info("MacroBot: practice session finished ({} events, {} frames) — waiting for Save",
+                   m_buffer.events.size(), m_frame);
+    }
+
+    if (m_mode == Mode::Playing) {
+        // Mid-playback retry (the macro's own inputs led to a death, and
+        // GD is auto-resetting) — same settling rule applies: this reset
+        // has now settled, so it's safe to resume firing from scratch.
+        m_awaitingResetSettle = false;
+        m_playCursor = 0;
+    }
+    m_frame = 0;
+}
+
+std::optional<std::filesystem::path> MacroManager::writeMacro(const MacroData& data) {
+    auto base = sanitizeFilename(data.levelName.empty() ? "macro" : data.levelName);
+    // Don't clobber an existing macro with the same level name — append a
+    // numeric suffix instead.
+    auto path = uniqueMacroPath(macrosDir(), base);
+
+    auto bytes = serializeMacro(data);
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        log::error("MacroBot: failed to write macro file {}", path.string());
+        return std::nullopt;
+    }
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    f.close();
+    log::info("MacroBot: saved macro to {}", path.string());
+    return path;
+}
+
+void MacroManager::saveStandbyMacro() {
+    if (m_mode != Mode::Standby) return;
+
+    auto path = writeMacro(m_buffer);
+    if (!path) return;
+
+    // Arm what we just saved so hitting Play immediately after Save just
+    // works without needing to reload it from disk.
+    m_armed = m_buffer;
+    m_armedDisplayName = path->stem().string();
+    m_armedPath = *path;
+
+    m_mode = Mode::Idle;
+    m_buffer = MacroData{};
+}
+
+void MacroManager::onLevelComplete() {
+    // Only a live recording session can finish by completing the level.
+    if (m_mode != Mode::Recording) return;
+    if (!m_haveStartTime) return; // nothing real was captured yet
+
+    // Unlike a death, a completion needs no trimming: a button still held
+    // at the end wall is real input (e.g. holding ship up to the finish),
+    // and nothing here is death cleanup.
+    m_buffer.totalFrames = m_frame;
+    m_timeLog.clear();
+    m_haveStartTime = false;
+
+    if (autoSaveEnabled()) {
+        if (auto path = writeMacro(m_buffer)) {
+            m_armed = m_buffer;
+            m_armedDisplayName = path->stem().string();
+            m_armedPath = *path;
+            m_mode = Mode::Idle;
+            m_buffer = MacroData{};
+            Notification::create("Macro saved: " + path->stem().string(), NotificationIcon::Success)->show();
+            return;
+        }
+        Notification::create("Macro auto-save failed", NotificationIcon::Error)->show();
+    }
+
+    // Auto-save is off (or failed): keep the finished run on Standby so
+    // the Save button in the menu still works.
+    m_mode = Mode::Standby;
+    log::info("MacroBot: level completed — {} events, {} frames, waiting for Save",
+               m_buffer.events.size(), m_buffer.totalFrames);
+}
+
+void MacroManager::cancelRecording() {
+    log::info("MacroBot: cancelRecording — discarding {} buffered events (was mode={})",
+               m_buffer.events.size(), static_cast<int>(m_mode));
+    m_mode = Mode::Idle;
+    m_buffer = MacroData{};
+    m_timeLog.clear();
+    m_haveStartTime = false;
+}
+
+bool MacroManager::loadMacroFromFile(const std::filesystem::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        log::error("MacroBot: could not open {}", path.string());
+        return false;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    MacroData data;
+    if (!deserializeMacro(bytes, data)) {
+        log::error("MacroBot: {} is not a valid .mbf file", path.string());
+        return false;
+    }
+
+    m_armed = data;
+    m_armedDisplayName = path.stem().string();
+    m_armedPath = path;
+    log::info("MacroBot: loaded macro '{}' ({} events)", m_armedDisplayName.value(), data.events.size());
+    return true;
+}
+
+std::optional<std::string> MacroManager::armedMacroName() const {
+    return m_armedDisplayName;
+}
+
+void MacroManager::startPlaying() {
+    if (!m_armed.has_value()) return;
+    // Deliberately does NOT set m_mode = Playing or reset frame/cursor
+    // here — that happens in onLevelReset, once the level reset this is
+    // expected to be followed by (see beginPlayback() in BotMenu.cpp)
+    // has actually settled. See notifyResetLevelCalled() for why.
+    m_pendingPlaybackStart = true;
+    m_awaitingResetSettle = true;
+    log::info("MacroBot: [play] armed for playback, waiting for the level reset to settle");
+}
+
+void MacroManager::stopPlaying() {
+    if (m_mode == Mode::Playing) {
+        m_mode = Mode::Idle;
+    }
+    m_pendingPlaybackStart = false;
+    m_awaitingResetSettle = false;
+    m_playCursor = 0;
+}
+
+void MacroManager::notifyResetLevelCalled() {
+    if (m_mode == Mode::Playing || m_pendingPlaybackStart) {
+        m_awaitingResetSettle = true;
+    }
+}
+
+void MacroManager::onPhysicsStep(const std::function<void(uint8_t button, bool player1, bool down)>& fireInput) {
+    if (m_mode == Mode::Playing && m_armed.has_value() && !m_awaitingResetSettle) {
+        const auto& events = m_armed->events;
+        while (m_playCursor < events.size() && events[m_playCursor].frame <= m_frame) {
+            const auto& ev = events[m_playCursor];
+            m_injecting = true;
+            fireInput(ev.button, ev.player, ev.state);
+            m_injecting = false;
+            m_playCursor++;
+        }
+        if (m_playCursor >= events.size()) {
+            // Reached the end of the macro; stop consuming further steps
+            // but leave the level running normally.
+            m_mode = Mode::Idle;
+        }
+    }
+
+    m_frame++;
+}
+
+void MacroManager::recordInput(int button, bool player1, bool down) {
+    // Only capture while actively Recording — this is a no-op while on
+    // Standby (waiting for Save) or in any other mode, by design.
+    if (m_mode != Mode::Recording) return;
+    InputEvent ev;
+    ev.frame = m_frame;
+    ev.button = static_cast<uint8_t>(button);
+    ev.player = player1;
+    ev.state = down;
+    m_buffer.events.push_back(ev);
+}
+
+bool MacroManager::autoSaveEnabled() const {
+    return Mod::get()->getSavedValue<bool>("auto-save", true);
+}
+
+void MacroManager::setAutoSaveEnabled(bool enabled) {
+    Mod::get()->setSavedValue<bool>("auto-save", enabled);
+}
+
+bool MacroManager::blockInputsEnabled() const {
+    return Mod::get()->getSavedValue<bool>("block-inputs", true);
+}
+
+void MacroManager::setBlockInputsEnabled(bool enabled) {
+    Mod::get()->setSavedValue<bool>("block-inputs", enabled);
+}
+
+bool MacroManager::shouldBlockLiveInput() const {
+    if (m_injecting) return false;
+    if (m_mode != Mode::Playing && !m_pendingPlaybackStart) return false;
+    return blockInputsEnabled();
+}
+
+std::vector<std::filesystem::path> MacroManager::listMacros() const {
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (auto& entry : std::filesystem::directory_iterator(macrosDir(), ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".mbf") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        return a.filename().string() < b.filename().string();
+    });
+    return files;
+}
+
+bool MacroManager::renameMacro(const std::filesystem::path& path, const std::string& newName) {
+    auto trimmed = trimSpaces(newName);
+    auto base = sanitizeFilename(trimmed);
+    if (base == path.stem().string()) return true; // nothing to do
+
+    auto target = path.parent_path() / (base + ".mbf");
+    if (std::filesystem::exists(target)) return false;
+
+    std::error_code ec;
+    std::filesystem::rename(path, target, ec);
+    if (ec) {
+        log::error("MacroBot: rename failed: {}", ec.message());
+        return false;
+    }
+
+    if (m_armedPath && *m_armedPath == path) {
+        m_armedPath = target;
+        m_armedDisplayName = base;
+    }
+    return true;
+}
+
+bool MacroManager::deleteMacro(const std::filesystem::path& path) {
+    std::error_code ec;
+    bool removed = std::filesystem::remove(path, ec);
+    if (ec || !removed) {
+        log::error("MacroBot: delete failed for {}", path.string());
+        return false;
+    }
+
+    // Deleting the macro that's currently armed disarms it, so Play can't
+    // quietly keep replaying something the user just got rid of.
+    if (m_armedPath && *m_armedPath == path) {
+        if (m_mode == Mode::Playing) stopPlaying();
+        m_armed.reset();
+        m_armedDisplayName.reset();
+        m_armedPath.reset();
+    }
+    return true;
+}
+
+void MacroManager::ensureHudLabels() {
+    if (m_hudFrameLabel && m_hudEventsLabel) return;
+
+    auto scene = CCDirector::sharedDirector()->getRunningScene();
+    if (!scene) return;
+
+    // Parented directly to the scene root, not to PlayLayer — removes
+    // any dependency on PlayLayer's own coordinate space or init timing.
+    // Bottom-right corner, right-anchored, well away from GD's own
+    // top-focused HUD elements (percentage/attempt labels) so nothing
+    // overlaps or gets drawn over.
+    auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+    m_hudFrameLabel = CCLabelBMFont::create("Frame: 0", "chatFont.fnt");
+    m_hudFrameLabel->setAnchorPoint({1.f, 0.f});
+    m_hudFrameLabel->setScale(0.5f);
+    m_hudFrameLabel->setID("macrobot-frame-label"_spr);
+    m_hudFrameLabel->setPosition({winSize.width - 6.f, 40.f});
+    m_hudFrameLabel->retain(); // survive a scene-level removeAllChildren
+                               // without leaving us a dangling pointer;
+                               // released again in clearHud()
+    scene->addChild(m_hudFrameLabel, 20000);
+
+    m_hudEventsLabel = CCLabelBMFont::create("Events: 0", "chatFont.fnt");
+    m_hudEventsLabel->setAnchorPoint({1.f, 0.f});
+    m_hudEventsLabel->setScale(0.5f);
+    m_hudEventsLabel->setID("macrobot-events-label"_spr);
+    m_hudEventsLabel->setPosition({winSize.width - 6.f, 24.f});
+    m_hudEventsLabel->retain();
+    scene->addChild(m_hudEventsLabel, 20000);
+}
+
+void MacroManager::clearHud() {
+    if (m_hudFrameLabel) {
+        m_hudFrameLabel->removeFromParentAndCleanup(true);
+        m_hudFrameLabel->release();
+        m_hudFrameLabel = nullptr;
+    }
+    if (m_hudEventsLabel) {
+        m_hudEventsLabel->removeFromParentAndCleanup(true);
+        m_hudEventsLabel->release();
+        m_hudEventsLabel = nullptr;
+    }
+}
+
+void MacroManager::updateHud() {
+    ensureHudLabels();
+
+    bool show = m_debugHudEnabled;
+
+    if (m_hudFrameLabel) m_hudFrameLabel->setVisible(show);
+    if (m_hudEventsLabel) m_hudEventsLabel->setVisible(show);
+    if (!show) return;
+
+    if (m_hudFrameLabel) {
+        m_hudFrameLabel->setString(("Frame: " + std::to_string(m_frame)).c_str());
+    }
+
+    if (m_hudEventsLabel) {
+        std::string eventsText;
+        switch (m_mode) {
+            case Mode::Recording:
+                eventsText = "Events: " + std::to_string(recordedEventCount()) + " (recording)";
+                break;
+            case Mode::Standby:
+                eventsText = "Events: " + std::to_string(recordedEventCount()) + " (standby, unsaved)";
+                break;
+            case Mode::Playing:
+                eventsText = "Events: " + std::to_string(playedEventCount()) + "/"
+                              + std::to_string(totalArmedEventCount()) + " (playing)";
+                break;
+            default:
+                eventsText = "Events: " + std::to_string(totalArmedEventCount()) + " armed";
+                break;
+        }
+        m_hudEventsLabel->setString(eventsText.c_str());
+    }
+}
+
+}

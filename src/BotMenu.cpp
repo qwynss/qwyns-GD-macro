@@ -1,0 +1,326 @@
+#include "BotMenu.hpp"
+#include "LoadPopup.hpp"
+#include "MacroManager.hpp"
+#include <Geode/binding/PlayLayer.hpp>
+#include <Geode/binding/PauseLayer.hpp>
+
+using namespace geode::prelude;
+
+namespace macrobot {
+
+// Finds an active PauseLayer in the scene (if the bot menu was opened
+// from the pause screen).
+static PauseLayer* findPauseLayer() {
+    auto pl = PlayLayer::get();
+    if (!pl || !pl->getParent()) return nullptr;
+    for (auto child : CCArrayExt<CCNode*>(pl->getParent()->getChildren())) {
+        if (auto pause = typeinfo_cast<PauseLayer*>(child)) {
+            return pause;
+        }
+    }
+    return nullptr;
+}
+
+// Resumes gameplay if we're currently paused.
+static void resumeIfPaused() {
+    if (auto pause = findPauseLayer()) {
+        pause->onResume(nullptr);
+    }
+}
+
+// Record should "automatically go into practice mode and start the
+// session": if we're not already in practice mode, clicking GD's own
+// practice-mode pause button both enables it and resumes gameplay
+// (exactly like a manual click would). If practice mode is already on,
+// just resume.
+static void enterPracticeAndResume() {
+    auto pl = PlayLayer::get();
+    auto pause = findPauseLayer();
+    if (!pl || !pause) return;
+
+    if (!pl->m_isPracticeMode) {
+        pause->onPracticeMode(nullptr);
+    } else {
+        pause->onResume(nullptr);
+    }
+}
+
+void beginPlayback() {
+    auto& mgr = MacroManager::get();
+    if (!mgr.hasArmedMacro()) return;
+    // Guard here too (not just the Play button's enabled state): Load's
+    // auto-play reaches this same function, and starting playback while
+    // a recording is in progress would silently abandon its buffer.
+    if (mgr.mode() == Mode::Recording) return;
+
+    mgr.startPlaying();
+
+    if (auto pl = PlayLayer::get()) {
+        // Restart the attempt from the beginning so the macro's recorded
+        // step indices line up with the level's actual start.
+        pl->resetLevel();
+    }
+    resumeIfPaused();
+}
+
+BotMenuPopup* BotMenuPopup::s_current = nullptr;
+
+BotMenuPopup* BotMenuPopup::create() {
+    auto ret = new BotMenuPopup();
+    if (ret->init()) {
+        ret->autorelease();
+        return ret;
+    }
+    delete ret;
+    return nullptr;
+}
+
+void BotMenuPopup::closeIfOpen() {
+    if (s_current) {
+        s_current->closeSelf();
+    }
+}
+
+void BotMenuPopup::closeSelf() {
+    if (s_current == this) {
+        s_current = nullptr;
+    }
+    this->setKeypadEnabled(false);
+    this->removeFromParentAndCleanup(true);
+}
+
+void BotMenuPopup::keyBackClicked() {
+    closeSelf();
+}
+
+void BotMenuPopup::onCloseClicked(CCObject*) {
+    closeSelf();
+}
+
+static constexpr float kPanelWidth = 260.f;
+static constexpr float kPanelHeight = 300.f;
+
+CCMenuItemToggler* BotMenuPopup::makeToggle(CCMenu* menu, const char* label, float y, SEL_MenuHandler handler) {
+    auto offSpr = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
+    auto onSpr = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
+    auto toggle = CCMenuItemToggler::create(offSpr, onSpr, this, handler);
+    toggle->setScale(0.7f);
+    toggle->setPosition({kPanelWidth * 0.5f - 95.f, y});
+    menu->addChild(toggle);
+
+    auto text = CCLabelBMFont::create(label, "chatFont.fnt");
+    text->setScale(0.55f);
+    text->setAnchorPoint({0.f, 0.5f});
+    text->setPosition({kPanelWidth * 0.5f - 77.f, y});
+    this->addChild(text);
+    return toggle;
+}
+
+bool BotMenuPopup::init() {
+    if (!CCLayer::init()) return false;
+
+    this->setContentSize({kPanelWidth, kPanelHeight});
+
+    // Background "card" — a plain, self-drawn panel rather than
+    // anything borrowed from Popup/FLAlertLayer, so its position always
+    // matches this layer's own position exactly.
+    auto bg = CCScale9Sprite::create("GJ_square01.png");
+    bg->setContentSize({kPanelWidth, kPanelHeight});
+    bg->setAnchorPoint({0.f, 0.f});
+    bg->setPosition({0.f, 0.f});
+    this->addChild(bg);
+
+    auto title = CCLabelBMFont::create("MacroPath", "goldFont.fnt");
+    title->setScale(0.9f);
+    title->setPosition({kPanelWidth * 0.5f, kPanelHeight - 22.f});
+    this->addChild(title);
+
+    auto menu = CCMenu::create();
+    menu->setPosition({0.f, 0.f});
+    this->addChild(menu);
+
+    // --- Close button (top-right corner) --------------------------------
+    auto closeSprite = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
+    auto closeBtn = CCMenuItemSpriteExtra::create(
+        closeSprite, this, menu_selector(BotMenuPopup::onCloseClicked)
+    );
+    closeBtn->setPosition({kPanelWidth - 16.f, kPanelHeight - 16.f});
+    menu->addChild(closeBtn);
+
+    // --- Record button (top-left) ------------------------------------
+    auto recordLabel = ButtonSprite::create("Record", "bigFont.fnt", "GJ_button_01.png", 0.75f);
+    m_recordBtn = CCMenuItemSpriteExtra::create(
+        recordLabel, this, menu_selector(BotMenuPopup::onRecord)
+    );
+    m_recordBtn->setPosition({kPanelWidth * 0.5f - 60.f, kPanelHeight * 0.76f});
+    menu->addChild(m_recordBtn);
+
+    // --- Save button (top-right) --------------------------------------
+    auto saveLabel = ButtonSprite::create("Save", "bigFont.fnt", "GJ_button_02.png", 0.75f);
+    m_saveBtn = CCMenuItemSpriteExtra::create(
+        saveLabel, this, menu_selector(BotMenuPopup::onSave)
+    );
+    m_saveBtn->setPosition({kPanelWidth * 0.5f + 60.f, kPanelHeight * 0.76f});
+    menu->addChild(m_saveBtn);
+
+    // --- Play button (mid-left) ------------------------------------
+    auto playLabel = ButtonSprite::create("Play", "bigFont.fnt", "GJ_button_01.png", 0.75f);
+    m_playBtn = CCMenuItemSpriteExtra::create(
+        playLabel, this, menu_selector(BotMenuPopup::onPlay)
+    );
+    m_playBtn->setPosition({kPanelWidth * 0.5f - 60.f, kPanelHeight * 0.60f});
+    menu->addChild(m_playBtn);
+
+    // --- Load button (mid-right) -----------------------------------
+    auto loadLabel = ButtonSprite::create("Load", "bigFont.fnt", "GJ_button_01.png", 0.75f);
+    auto loadBtn = CCMenuItemSpriteExtra::create(
+        loadLabel, this, menu_selector(BotMenuPopup::onLoad)
+    );
+    loadBtn->setPosition({kPanelWidth * 0.5f + 60.f, kPanelHeight * 0.60f});
+    menu->addChild(loadBtn);
+
+    // --- Option toggles -----------------------------------------------
+    m_autoSaveToggle = makeToggle(menu, "Auto-save on completion", kPanelHeight * 0.44f,
+                                  menu_selector(BotMenuPopup::onToggleAutoSave));
+    m_blockInputsToggle = makeToggle(menu, "Block inputs while playing", kPanelHeight * 0.33f,
+                                     menu_selector(BotMenuPopup::onToggleBlockInputs));
+    m_hudToggle = makeToggle(menu, "Debug HUD", kPanelHeight * 0.22f,
+                             menu_selector(BotMenuPopup::onToggleHud));
+
+    // --- Status label ----------------------------------------------
+    m_statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
+    m_statusLabel->setScale(0.5f);
+    m_statusLabel->setPosition({kPanelWidth * 0.5f, kPanelHeight * 0.09f});
+    m_statusLabel->setID("macrobot-status-label");
+    this->addChild(m_statusLabel);
+
+    refreshButtonStates();
+    return true;
+}
+
+void BotMenuPopup::show() {
+    s_current = this;
+
+    auto scene = CCDirector::sharedDirector()->getRunningScene();
+    if (!scene) return;
+
+    auto winSize = CCDirector::sharedDirector()->getWinSize();
+    auto size = this->getContentSize();
+    // Centered: anchor is (0,0) (default CCLayer), so the position we
+    // set is the panel's bottom-left corner — placing it at
+    // (winSize - panelSize) / 2 puts the panel's actual center on the
+    // screen's actual center.
+    this->setPosition({(winSize.width - size.width) * 0.5f, (winSize.height - size.height) * 0.5f});
+    this->setZOrder(10000);
+    scene->addChild(this, 10000);
+
+    this->setKeypadEnabled(true);
+    refreshButtonStates();
+}
+
+void BotMenuPopup::refreshButtonStates() {
+    auto& mgr = MacroManager::get();
+    auto mode = mgr.mode();
+
+    if (m_recordBtn) {
+        if (auto spr = typeinfo_cast<ButtonSprite*>(m_recordBtn->getNormalImage())) {
+            spr->setString(mode == Mode::Recording ? "Stop" : "Record");
+        }
+    }
+
+    if (m_saveBtn) {
+        bool canSave = mgr.hasPendingSave();
+        m_saveBtn->setEnabled(canSave);
+        m_saveBtn->setOpacity(canSave ? 255 : 120);
+    }
+
+    if (m_playBtn) {
+        // Disabled while actively Recording, not just when nothing's
+        // armed: clicking Play mid-recording would silently abandon the
+        // in-progress buffer (never saved, never explicitly discarded)
+        // and hand control to playback instead — confusing, and avoidable.
+        bool canPlay = mgr.hasArmedMacro() && mode != Mode::Recording;
+        m_playBtn->setEnabled(canPlay);
+        m_playBtn->setOpacity(canPlay ? 255 : 120);
+    }
+
+    if (m_hudToggle) {
+        m_hudToggle->toggle(mgr.isDebugHudEnabled());
+    }
+    if (m_autoSaveToggle) {
+        m_autoSaveToggle->toggle(mgr.autoSaveEnabled());
+    }
+    if (m_blockInputsToggle) {
+        m_blockInputsToggle->toggle(mgr.blockInputsEnabled());
+    }
+
+    if (m_statusLabel) {
+        std::string status;
+        switch (mode) {
+            case Mode::Recording: status = "Recording... play the attempt"; break;
+            case Mode::Standby:   status = "Attempt captured - tap Save"; break;
+            default: {
+                if (auto name = mgr.armedMacroName()) {
+                    status = "Loaded: " + *name;
+                } else {
+                    status = "No macro loaded";
+                }
+                break;
+            }
+        }
+        m_statusLabel->setString(status.c_str());
+    }
+}
+
+void BotMenuPopup::onRecord(CCObject*) {
+    auto& mgr = MacroManager::get();
+    auto mode = mgr.mode();
+
+    if (mode == Mode::Recording || mode == Mode::Standby) {
+        // Starting over discards whatever was captured/pending.
+        mgr.cancelRecording();
+    }
+
+    if (auto pl = PlayLayer::get()) {
+        if (auto level = pl->m_level) {
+            mgr.setLevelName(level->m_levelName);
+        }
+    }
+    mgr.startRecording();
+
+    enterPracticeAndResume();
+    closeSelf();
+}
+
+void BotMenuPopup::onSave(CCObject*) {
+    MacroManager::get().saveStandbyMacro();
+    refreshButtonStates();
+}
+
+void BotMenuPopup::onPlay(CCObject*) {
+    beginPlayback();
+    closeSelf();
+}
+
+void BotMenuPopup::onLoad(CCObject*) {
+    LoadPopup::create()->show();
+}
+
+void BotMenuPopup::onToggleAutoSave(CCObject*) {
+    auto& mgr = MacroManager::get();
+    mgr.setAutoSaveEnabled(!mgr.autoSaveEnabled());
+}
+
+void BotMenuPopup::onToggleBlockInputs(CCObject*) {
+    auto& mgr = MacroManager::get();
+    mgr.setBlockInputsEnabled(!mgr.blockInputsEnabled());
+}
+
+void BotMenuPopup::onToggleHud(CCObject*) {
+    auto& mgr = MacroManager::get();
+    mgr.setDebugHudEnabled(!mgr.isDebugHudEnabled());
+    // CCMenuItemToggler already flips its own visual state on click; we
+    // don't need to touch m_hudToggle here.
+}
+
+}

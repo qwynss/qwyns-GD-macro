@@ -1,0 +1,206 @@
+#pragma once
+#include "MacroFormat.hpp"
+#include <Geode/Geode.hpp>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <vector>
+
+namespace macrobot {
+
+enum class Mode {
+    Idle,
+    Recording,  // actively capturing input for the current attempt
+    Standby,    // one attempt was captured and the session ended; waiting
+                // for the user to hit Save. New attempts are NOT recorded
+                // while in this state.
+    Playing
+};
+
+// Owns the single source of truth for "are we recording / on standby /
+// playing right now", the in-progress buffer, and disk IO. One instance
+// for the whole mod (GD only ever has one active PlayLayer anyway).
+class MacroManager {
+public:
+    static MacroManager& get();
+
+    // --- Transport controls, called from the bot menu UI ---------------
+
+    // Begins capturing input for a fresh attempt. Discards anything
+    // previously pending (recording or standby).
+    void startRecording();
+
+    // Writes whatever's currently pending (must be in Standby, i.e. a
+    // finished attempt that hasn't been saved yet) to disk, named after
+    // the level, and arms it so Play works immediately. No-op if there's
+    // nothing pending.
+    void saveStandbyMacro();
+
+    // Discards whatever's pending (Recording or Standby) without saving.
+    void cancelRecording();
+
+    // Loads `path` into the "armed" macro slot. Does not start playback.
+    bool loadMacroFromFile(const std::filesystem::path& path);
+
+    // Starts playing whatever is currently armed (from loadMacroFromFile,
+    // or a macro that was just saved). Does NOT immediately switch to
+    // Mode::Playing — see notifyResetLevelCalled()/onLevelReset for why:
+    // the caller is expected to trigger a level reset right after this
+    // (see beginPlayback() in BotMenu.cpp), and playback only actually
+    // starts once that reset has settled. No-op if nothing is armed.
+    void startPlaying();
+    void stopPlaying();
+
+    // --- Settings (persisted with Geode saved values) -------------------
+    // Auto-save: when the level is completed while Recording, the macro
+    // is written to disk immediately (no manual Save press needed).
+    bool autoSaveEnabled() const;
+    void setAutoSaveEnabled(bool enabled);
+
+    // Block inputs: while a macro is playing, real (live) button presses
+    // are ignored so they can't interfere with the replay.
+    bool blockInputsEnabled() const;
+    void setBlockInputsEnabled(bool enabled);
+
+    // True when a live input should be swallowed right now (see above).
+    // Inputs injected by playback itself are never blocked.
+    bool shouldBlockLiveInput() const;
+
+    // Called from the PlayLayer::levelComplete hook.
+    void onLevelComplete();
+
+    // --- Macro file management -----------------------------------------
+    std::vector<std::filesystem::path> listMacros() const;
+    bool renameMacro(const std::filesystem::path& path, const std::string& newName);
+    bool deleteMacro(const std::filesystem::path& path);
+
+    Mode mode() const { return m_mode; }
+    bool hasArmedMacro() const { return m_armed.has_value(); }
+    bool hasPendingSave() const { return m_mode == Mode::Standby; }
+    std::optional<std::string> armedMacroName() const;
+
+    // --- Debug HUD (toggleable frame + event counters) -----------------
+    bool isDebugHudEnabled() const { return m_debugHudEnabled; }
+    void setDebugHudEnabled(bool enabled) { m_debugHudEnabled = enabled; }
+
+    uint32_t currentFrame() const { return m_frame; }
+    size_t recordedEventCount() const { return m_buffer.events.size(); }
+    size_t playedEventCount() const { return m_playCursor; }
+    size_t totalArmedEventCount() const { return m_armed ? m_armed->events.size() : 0; }
+
+    // Refreshes (and lazily creates, first call) the debug HUD's two
+    // labels. Deliberately NOT dependent on PlayLayer::init() handing
+    // anything off — the labels are created here, the first time this is
+    // called with a running scene available, and parented directly to
+    // the scene root rather than to PlayLayer. That removes any
+    // dependency on PlayLayer-specific init ordering or coordinate space
+    // entirely; the only remaining requirement is that SOMETHING calls
+    // updateHud() periodically, which PlayerObject::update already does
+    // (proven firing, since it's what drives playback).
+    void updateHud();
+
+    // Destroys the HUD labels (if created) and clears them. Call this on
+    // leaving a level (PlayLayer::onQuit) so they don't linger attached
+    // to a scene that's about to go away.
+    void clearHud();
+
+    // --- Hooks into these from PlayerObject::update, see main.cpp -------
+    // Called once per actual physics substep (PlayerObject::update fires
+    // once per real GD physics tick, not once per rendered frame the way
+    // PlayLayer::update does — GD runs several physics substeps inside a
+    // single rendered frame). This is the correct, verified granularity
+    // for frame-accurate macro playback. Called BEFORE
+    // PlayerObject::update() itself runs so a due input takes effect in
+    // the same substep a live touch would have (touches/keys dispatch
+    // before the scheduler's update calls in cocos2d's frame loop).
+    void onPhysicsStep(const std::function<void(uint8_t button, bool player1, bool down)>& fireInput);
+
+    // Called from the handleButton hook. Only stores the transition while
+    // actively Recording; no-op in every other mode (in particular, a
+    // no-op while on Standby — that's the whole point of Standby).
+    void recordInput(int button, bool player1, bool down);
+
+    // Called from PlayerObject::update (see main.cpp) while Recording,
+    // with the level's current elapsed time (PlayLayer::m_gameState::
+    // m_levelTime). Used to build a lightweight log matching "level time
+    // reached" to "frame it happened on", so a later checkpoint respawn
+    // (see onLevelReset) can figure out which frame to roll back to.
+    // Keyed on level time rather than player X position — confirmed
+    // against a working reference bot, which uses exactly this field for
+    // its own tick/checkpoint bookkeeping — specifically because it's
+    // guaranteed monotonically increasing during real gameplay (time
+    // only moves forward), whereas X position isn't: a level with a
+    // backward-scrolling segment could make a position-keyed log match
+    // a respawn against the wrong point entirely. No-op outside Recording.
+    void logTime(double levelTime);
+
+    // Called when PlayLayer::resetLevel() fires, with the level's
+    // elapsed time after the reset has settled. Practice mode is passed
+    // in explicitly because a reset at the level start is NOT enough to
+    // determine whether the recording session has ended: dying before
+    // the first checkpoint also respawns at the beginning.
+    //
+    // While practice mode is active, every reset belongs to the same
+    // recording session: checkpoint deaths roll back to the checkpoint
+    // frame, while deaths/restarts at the beginning roll back to frame 0.
+    // The recording only moves to Standby once practice mode is no longer
+    // active.
+    void onLevelReset(double respawnLevelTime, bool practiceMode);
+
+    // Called synchronously from PlayLayer::resetLevel() (see main.cpp),
+    // the instant a reset happens — NOT deferred. If a playback session
+    // just started or is already running, this immediately stops
+    // onPhysicsStep from firing any further events until onLevelReset's
+    // deferred check confirms the reset has settled and re-establishes
+    // frame 0 / the play cursor. Without this, there was a real accuracy
+    // bug: startPlaying() set frame/cursor to 0 immediately, but the
+    // level's actual reset doesn't settle until a frame later — in that
+    // gap, a few of the macro's first events would fire against a not-
+    // yet-settled game state, then get discarded and re-fired a second
+    // time once the settled reset zeroed frame/cursor again. Same thing
+    // happened on every mid-playback retry, not just the very first one.
+    void notifyResetLevelCalled();
+
+    void setLevelName(const std::string& name) { m_levelName = name; }
+
+    std::filesystem::path macrosDir() const;
+
+private:
+    MacroManager() = default;
+
+    std::optional<std::filesystem::path> writeMacro(const MacroData& data);
+    void ensureHudLabels();
+    uint32_t frameForLevelTime(double levelTime) const;
+    void truncateToFrame(uint32_t frame);
+
+    Mode m_mode = Mode::Idle;
+    std::string m_levelName;
+    uint32_t m_frame = 0;
+    size_t m_playCursor = 0;
+    bool m_debugHudEnabled = false;
+
+    MacroData m_buffer;                    // recording / standby buffer
+    std::optional<MacroData> m_armed;      // loaded / just-saved, ready to play
+    std::optional<std::string> m_armedDisplayName;
+    std::optional<std::filesystem::path> m_armedPath;
+    bool m_injecting = false;              // true only while playback is feeding
+                                            // an input into the game
+    bool m_pendingPlaybackStart = false;   // startPlaying() was called; waiting
+                                            // for the level reset it triggers to settle
+    bool m_awaitingResetSettle = false;    // a resetLevel() just fired while Playing;
+                                            // onPhysicsStep must not fire until this clears
+
+    // Level-time -> frame log, built while Recording, used to figure out
+    // which frame a checkpoint respawn should roll back to. Keyed on
+    // PlayLayer::m_gameState::m_levelTime rather than X position — see
+    // logTime()'s comment for why.
+    std::vector<std::pair<double, uint32_t>> m_timeLog;
+    double m_sessionStartTime = 0.0;
+    bool m_haveStartTime = false;
+    int m_logThrottle = 0;
+
+    cocos2d::CCLabelBMFont* m_hudFrameLabel = nullptr;
+    cocos2d::CCLabelBMFont* m_hudEventsLabel = nullptr;
+};
+
+}
