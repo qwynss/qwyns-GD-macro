@@ -1,0 +1,18 @@
+{
+    "geode": "5.10.1",
+    "version": "v2.0.0-beta.1",
+    "id": "qwynss.macropath",
+    "name": "MacroPath",
+    "developer": "qwynss",
+    "description": "Macro recorder and player with auto-save, input blocking, and a macro manager. Pathfinding auto-solver planned. Forked from MacroBot by malik (MIT).",
+    "tags": ["gameplay", "utility", "offline"],
+    "gd": {
+        "win": "2.2081",
+        "android": "2.2081"
+    },
+    "resources": {
+        "sprites": [
+            "resources/botButton.png"
+        ]
+    }
+}
